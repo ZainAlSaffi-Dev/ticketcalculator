@@ -2,8 +2,8 @@
 
 
 *The first half derives the break-even formula step-by-step.*  
-*The second half maps every symbol to the Python variables used in
-`ticket.py`.
+*The second half maps every symbol to the Python functions in
+`ticket2.py`.*
 
 ## 0 Running frontend ticket2.py
 
@@ -11,7 +11,16 @@
 streamlit run ticket2.py
 ```
 
-The parameters are all adjusted in the UI
+Tabs: **Hackathon** (prizes, catering, merch tiers), **Standard event**
+(networking/smaller events), **Collab event** (splits the shortfall evenly or
+by attendees between clubs). Every tab takes ticket rounds (e.g. $15 → $20 → $25)
+and shows how much UQCS spends plus the break-even price for each round.
+
+Self-check for the maths:
+
+```bash
+python3 test_ticket2.py
+```
 
 ---
 
@@ -140,20 +149,14 @@ $$
 
 ## 10  How the code mirrors the maths
 
-| Python variable | Math symbol | Notes |
-|-----------------|-------------|-------|
-| `REFUND` | φ | refund rate |
-| `F_FIXED` | F | total fixed costs |
-| `SPONSOR` | S | sponsorship dollars |
-| `CATERING / head_total` | part of `v` | per-head food |
-| `MERCH_UNIT` | part of `v` | shirt/hoodie cost (if tier has merch) |
-| `gap` | $(F-S)\times\text{weight}$ | each tier’s share of the gap |
-| `P_net` | $v+\dfrac{\text{gap}}{(1-φ)Q}$ | break-even price **you keep** |
-| `P_gross` | $P_\text{net}/(1-f)$ | price shown on ticket site |
-
-*Function `price_tiers()`* implements the proportional gap split for
-hackathons.  
-
-*Function `simple_price()`* applies the ultra-simple shortcut for any
-single-price event.
-
+| Python | Math symbol | Notes |
+|--------|-------------|-------|
+| sidebar *Refund rate* | φ | refund rate |
+| sidebar *Platform fee* | f | ticket-site fee |
+| cost table + catering | F | catering is a fixed total (ordered up front) |
+| *contribution* input | S | UQCS / sponsor / club money put in |
+| *Merch cost* column | part of `v` | merch unit × show-ups with merch |
+| `round_table()` | $(1-φ)(1-f)P\,Q$ per round | gross → refunds → fees → net |
+| `summary()` | $F + \text{merch} - \text{net}$ | what UQCS spends (negative = surplus) |
+| `break_even_shift()` | Δ | same $ added to every round so profit = 0 after S |
+| `split_between_clubs()` | – | even or attendee-weighted split of the shortfall |

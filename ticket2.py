@@ -1,305 +1,397 @@
-import streamlit as st
+"""UQCS event ticket calculator.  Run with:  streamlit run ticket2.py
+
+Money model (see README §8-9):
+  net revenue per ticket = price × (1 − refund) × (1 − platform fee)
+  costs                  = fixed costs (incl. catering) + merch per show-up
+  UQCS spend             = costs − net revenue   (negative = surplus)
+"""
 import pandas as pd
-import numpy as np
 
-# --- Constants and Default Values ---
-DEFAULT_REFUND_RATE = 0.03
-DEFAULT_PLATFORM_FEE_RATE = 0.04
-DEFAULT_MERCH_UNIT_COST = 20.00
-DEFAULT_PRICE_INCREASE_CAP = 5.00
+ROUND_COLS = ["Round", "Price", "Tickets", "Merch"]
 
-# --- Core Calculation Logic (Functions remain the same) ---
 
-def _calculate_multi_tier_prices(tier_definitions, fixed_costs_event,
-                                 sponsor_allocation_event, event_total_catering_cost,
-                                 sum_of_sales_for_active_tiers,
-                                 event_refund_rate, event_platform_fee_rate):
-    priced_tiers = []
-    catering_per_head = event_total_catering_cost / sum_of_sales_for_active_tiers if sum_of_sales_for_active_tiers > 0 else 0
-    gap_to_cover_by_tickets = fixed_costs_event - sponsor_allocation_event
+# ──────────── Pure calculations (tested in test_ticket2.py) ────────────
 
-    for tier_def_original in tier_definitions:
-        tier_def = tier_def_original.copy()
-        tier_def['v_calc'] = catering_per_head + tier_def['merch_cost']
-        tier_priced_data = {**tier_def}
+def clean_rounds(rounds: pd.DataFrame) -> pd.DataFrame:
+    """Drop half-filled editor rows and coerce types."""
+    df = rounds.dropna(subset=["Price", "Tickets"]).copy()
+    df["Round"] = df["Round"].fillna("").astype(str)
+    df["Merch"] = df["Merch"].fillna(False).astype(bool)
+    return df.reset_index(drop=True)
 
-        if tier_def['sold'] <= 0:
-            tier_priced_data.update({'P_net': float('nan'), 'P_gross': float('nan')})
-            if 'v_calc' in tier_priced_data: del tier_priced_data['v_calc']
-            priced_tiers.append(tier_priced_data)
+
+def make_rounds(first_price, step, n, total) -> pd.DataFrame:
+    """n rounds rising by `step`; tickets spread evenly, remainder to the earliest rounds."""
+    n, total = int(n), int(total)
+    return pd.DataFrame([[f"Round {i + 1}", first_price + i * step, total // n + (i < total % n), False]
+                         for i in range(n)], columns=ROUND_COLS)
+
+
+def round_table(rounds, refund, fee, merch_unit) -> pd.DataFrame:
+    df = clean_rounds(rounds)
+    df["Gross sales"] = df["Price"] * df["Tickets"]
+    df["Refunds"] = df["Gross sales"] * refund
+    df["Platform fees"] = (df["Gross sales"] - df["Refunds"]) * fee
+    df["Net revenue"] = df["Gross sales"] - df["Refunds"] - df["Platform fees"]
+    df["Merch cost"] = df["Merch"] * df["Tickets"] * (1 - refund) * merch_unit
+    df["Running total"] = (df["Net revenue"] - df["Merch cost"]).cumsum()
+    return df
+
+
+def summary(table: pd.DataFrame, fixed_costs: float) -> dict:
+    costs = fixed_costs + table["Merch cost"].sum()
+    revenue = table["Net revenue"].sum()
+    return {"costs": costs, "revenue": revenue, "uqcs_spend": costs - revenue}
+
+
+def break_even_shift(rounds, fixed_costs, contribution, refund, fee, merch_unit) -> float:
+    """$ to add to every round price so that spend == contribution (keeps round steps)."""
+    t = round_table(rounds, refund, fee, merch_unit)
+    k = (1 - refund) * (1 - fee)
+    tickets = t["Tickets"].sum()
+    if tickets <= 0 or k <= 0:
+        return float("nan")
+    gap = fixed_costs + t["Merch cost"].sum() - contribution - t["Net revenue"].sum()
+    return gap / (k * tickets)
+
+
+def split_between_clubs(amount: float, clubs: pd.DataFrame, mode: str):
+    """Clubs with a Fixed pledge pay exactly that; the rest is split (even or by attendees)
+    between the others, capping anyone at their Max and pushing the excess onto the rest.
+    Returns (table, leftover): leftover > 0 = nobody left to cover it, < 0 = pledges exceed gap."""
+    df = clubs.dropna(subset=["Club"]).reset_index(drop=True)
+    df = df.assign(**{c: pd.to_numeric(df[c], errors="coerce") for c in ("Attendees", "Fixed", "Max")})
+    by_att = mode == "By attendees" and df["Attendees"].fillna(0).sum() > 0
+    weights = df["Attendees"].fillna(0) if by_att else pd.Series(1.0, index=df.index)
+    df["Amount"], df["How"], df["Share %"] = 0.0, "", 0.0
+    if df.empty:
+        return df, amount
+    if amount <= 0:  # surplus: hand it back by weight, pledges/caps don't apply
+        df["Share %"] = 100 * weights / weights.sum()
+        df["Amount"], df["How"] = amount * df["Share %"] / 100, "share of surplus"
+        return df, 0.0
+
+    fixed = df["Fixed"].notna()
+    df.loc[fixed, "Amount"], df.loc[fixed, "How"] = df.loc[fixed, "Fixed"], "fixed pledge"
+    left = amount - df["Amount"].sum()
+    active = ~fixed
+    while left > 1e-9 and active.any() and weights[active].sum() > 0:
+        share = left * weights[active] / weights[active].sum()
+        over = share > df.loc[active, "Max"]  # NaN max → never over
+        if not over.any():
+            df.loc[active, "Amount"] = share
+            df.loc[active, "How"] = "split by attendees" if by_att else "even split"
+            left = 0.0
+            break
+        hit = over[over].index
+        df.loc[hit, "Amount"], df.loc[hit, "How"] = df.loc[hit, "Max"], "capped at max"
+        left -= df.loc[hit, "Max"].sum()
+        active[hit] = False
+    df["Share %"] = df["Amount"] / amount * 100
+    return df, left
+
+
+def plain_clubs(split: pd.DataFrame) -> pd.DataFrame:
+    """Clubs with no Fixed or Max — in an even split they all pay the same."""
+    return split[split["Fixed"].isna() & split["Max"].isna()]
+
+
+def contributions_by_price(rounds, fixed_costs, clubs, mode, refund, fee, merch_unit, step=5.0):
+    """One row per price level (every round moved by the same $ step): the shortfall and
+    what each club pays. In an even split the no-limit clubs collapse into one column."""
+    base = clean_rounds(rounds)
+    rows = []
+    for i in range(-2, 5):
+        d = i * step
+        if (base["Price"] + d < 0).any():
             continue
-        
-        tier_gap_share = 0
-        if sum_of_sales_for_active_tiers > 0:
-            tier_gap_share = gap_to_cover_by_tickets * (tier_def['sold'] / sum_of_sales_for_active_tiers)
-        
-        denominator_p_net = (1 - event_refund_rate) * tier_def['sold']
-        P_net = tier_def['v_calc'] + (tier_gap_share / denominator_p_net) if denominator_p_net != 0 else float('inf')
-        
-        denominator_p_gross = (1 - event_platform_fee_rate)
-        P_gross = P_net / denominator_p_gross if denominator_p_gross != 0 else float('inf')
-        
-        tier_priced_data.update({'P_net': P_net, 'P_gross': P_gross})
-        if 'v_calc' in tier_priced_data: del tier_priced_data['v_calc']
-        priced_tiers.append(tier_priced_data)
-        
-    return priced_tiers
-
-def plan_event_scenarios(event_name: str,
-                         event_fixed_costs: float, event_total_catering_cost: float,
-                         total_expected_attendees_overall: int,
-                         merch_option: str, 
-                         merch_unit_cost: float,
-                         expected_merch_tickets_sold_input: int,
-                         last_year_regular_price: float,
-                         last_year_merch_price: float,
-                         sponsor_allocations_to_test: list,
-                         event_refund_rate: float,
-                         event_platform_fee_rate: float,
-                         price_increase_cap: float):
-    scenarios_summary = []
-
-    for s_alloc_raw in sponsor_allocations_to_test:
-        try:
-            s_alloc = float(s_alloc_raw)
-        except ValueError:
-            st.warning(f"Invalid sponsor allocation value skipped: {s_alloc_raw}")
-            continue
-        if s_alloc < 0: continue
-
-        current_scenario_data = {
-            'event_name': event_name, 'sponsor_allocation_tested': s_alloc,
-            'P_gross_regular': None, 'is_too_expensive_regular': None,
-            'P_gross_merch': None, 'is_too_expensive_merch': None,
-            'notes': ""
-        }
-
-        tier_definitions_for_calc = []
-        reg_sold_calc = 0
-        merch_sold_calc = 0
-
-        if merch_option == "No Merch":
-            reg_sold_calc = total_expected_attendees_overall
-        elif merch_option == "Bundled Merch (for all tickets)":
-            reg_sold_calc = total_expected_attendees_overall
-        elif merch_option == "Optional Merch Tickets (separate prices)":
-            if expected_merch_tickets_sold_input > total_expected_attendees_overall:
-                current_scenario_data['notes'] = "Input Error: Merch tickets > total attendees."
-                scenarios_summary.append(current_scenario_data)
-                continue
-            merch_sold_calc = expected_merch_tickets_sold_input
-            reg_sold_calc = total_expected_attendees_overall - merch_sold_calc
-        
-        if merch_option == "No Merch":
-            if reg_sold_calc > 0:
-                tier_definitions_for_calc.append({'name': "Regular", 'sold': reg_sold_calc, 'merch_cost': 0, 'last_year_price': last_year_regular_price})
-        elif merch_option == "Bundled Merch (for all tickets)":
-            if reg_sold_calc > 0:
-                tier_definitions_for_calc.append({'name': "Bundled", 'sold': reg_sold_calc, 'merch_cost': merch_unit_cost, 'last_year_price': last_year_regular_price})
-        elif merch_option == "Optional Merch Tickets (separate prices)":
-            if reg_sold_calc > 0:
-                tier_definitions_for_calc.append({'name': "Regular", 'sold': reg_sold_calc, 'merch_cost': 0, 'last_year_price': last_year_regular_price})
-            if merch_sold_calc > 0:
-                tier_definitions_for_calc.append({'name': "Merch-Inclusive", 'sold': merch_sold_calc, 'merch_cost': merch_unit_cost, 'last_year_price': last_year_merch_price})
-        
-        sum_of_sales_for_active_tiers = sum(tier['sold'] for tier in tier_definitions_for_calc)
-
-        if total_expected_attendees_overall == 0:
-            current_scenario_data['notes'] = "Attendees is 0; cannot price tickets."
-        
-        if current_scenario_data['notes']:
-            scenarios_summary.append(current_scenario_data)
-            continue
-        
-        priced_tiers_results = _calculate_multi_tier_prices(
-            tier_definitions_for_calc, event_fixed_costs, s_alloc,
-            event_total_catering_cost, sum_of_sales_for_active_tiers,
-            event_refund_rate, event_platform_fee_rate
-        )
-
-        for tier_result in priced_tiers_results:
-            P_gross = tier_result['P_gross']
-            is_too_expensive = None
-            ly_price_for_tier = tier_result.get('last_year_price')
-            if pd.notnull(P_gross) and np.isfinite(P_gross) and pd.notnull(ly_price_for_tier):
-                is_too_expensive = P_gross > (ly_price_for_tier + price_increase_cap)
-
-            if tier_result['name'] in ["Regular", "Bundled"]:
-                current_scenario_data['P_gross_regular'] = P_gross
-                current_scenario_data['is_too_expensive_regular'] = is_too_expensive
-            elif tier_result['name'] == "Merch-Inclusive":
-                current_scenario_data['P_gross_merch'] = P_gross
-                current_scenario_data['is_too_expensive_merch'] = is_too_expensive
-        
-        scenarios_summary.append(current_scenario_data)
-    return scenarios_summary
-
-# --- Streamlit App UI ---
-st.set_page_config(layout="wide", page_title="Event Ticket Price Calculator")
-st.title("🎟️ Event Ticket Price Calculator")
-
-# --- Initialisation ---
-if 'current_scenarios' not in st.session_state:
-    st.session_state.current_scenarios = []
-    st.session_state.merch_option_ui = "No Merch"
-
-# --- Main Page: Event Planning ---
-st.header("📊 Step 1: Enter Event Details")
-st.write("Use this form to calculate break-even ticket prices for an event under different subsidy scenarios.")
-
-with st.form(key="event_planning_form"):
-    st.subheader("Event Details")
-    event_name_form = st.text_input("Event Name", "My Awesome Event", help="A descriptive name for your event.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        total_expected_attendees_overall_form = st.number_input("Total Expected Attendees", min_value=0, value=180, step=5, help="Your best guess for the total number of people who will buy a ticket.")
-        last_year_regular_price_form = st.number_input("Last Year's Regular Ticket Price ($)", min_value=0.0, value=30.0, step=1.0, help="The price of a standard ticket for this event last year. Used to check if the new price is too high.")
-    with col2:
-        event_fixed_costs_form = st.number_input("Event Fixed Costs ($)", min_value=0.0, value=5000.0, step=100.0, help="Costs that don't change with the number of attendees (e.g., venue hire, AV, prize money).")
-        # --- MODIFIED ---
-        event_total_catering_cost_input = st.number_input("Total Catering Budget ($)", min_value=0.0, value=4000.0, step=50.0, help="The total budget for food and drinks. This is overridden by the detailed calculation below if used.")
-    
-    # --- ADDED: Detailed Catering Calculation ---
-    st.subheader("Catering Calculation (Optional)")
-    st.write("For events like hackathons with multiple meals, use this to calculate the total catering budget. If used, this overrides the 'Total Catering Budget' field above.")
-    
-    cat_col1, cat_col2 = st.columns(2)
-    with cat_col1:
-        cost_per_meal_person_form = st.number_input("Cost Per Meal Per Person ($)", min_value=0.0, value=0.0, step=0.50, help="The cost of a single meal (e.g., lunch) for one person.")
-    with cat_col2:
-        num_meal_occasions_form = st.number_input("Number of Meal Occasions", min_value=0, value=0, step=1, help="The number of times you will provide food (e.g., for a weekend hackathon, this might be 5 for Fri dinner, Sat breakfast/lunch/dinner, Sun breakfast).")
+        shifted = base.assign(Price=base["Price"] + d)
+        gap = summary(round_table(shifted, refund, fee, merch_unit), fixed_costs)["uqcs_spend"]
+        split, left = split_between_clubs(gap, clubs, mode)
+        plain = plain_clubs(split) if mode == "Even" else split.iloc[:0]
+        row = {"Price change": "now" if d == 0 else f"{'+' if d > 0 else '−'}{money(abs(d))}",
+               "Round prices": " / ".join(money(p) for p in shifted["Price"]),
+               "Shortfall": gap}
+        if len(plain):
+            row[f"Each other club (×{len(plain)})"] = plain["Amount"].iloc[0]
+        for _, c in split.drop(plain.index).iterrows():
+            row[c["Club"]] = c["Amount"]
+        row["Uncovered"] = max(left, 0.0)
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
-    st.subheader("Merchandise Options")
-    st.session_state.merch_option_ui = st.radio(
-        "Will this event have merchandise?",
-        ("No Merch", "Bundled Merch (for all tickets)", "Optional Merch Tickets (separate prices)"),
-        key="merch_option_radio_key",
-        horizontal=True,
-        help="Choose how merchandise will be handled. Merch cost is part of the per-attendee variable cost."
-    )
+# ──────────── UI ────────────
 
-    merch_unit_cost_submit = 0.0
-    expected_merch_tickets_sold_submit = 0
-    last_year_merch_price_submit = 0.0
+def money(x):
+    x = round(float(x), 2) + 0.0  # avoid "-$0.00"
+    return f"-${-x:,.2f}" if x < 0 else f"${x:,.2f}"
 
-    if st.session_state.merch_option_ui == "Bundled Merch (for all tickets)":
-        merch_unit_cost_submit = st.number_input("Merch Cost Per Unit ($)", min_value=0.0, value=DEFAULT_MERCH_UNIT_COST, step=1.0, help="The cost to produce one unit of the merchandise (e.g., one t-shirt).")
-    elif st.session_state.merch_option_ui == "Optional Merch Tickets (separate prices)":
-        col_m1, col_m2, col_m3 = st.columns(3)
-        with col_m1:
-            merch_unit_cost_submit = st.number_input("Merch Cost Per Unit ($)", min_value=0.0, value=DEFAULT_MERCH_UNIT_COST, step=1.0, help="The cost to produce one unit of the merchandise.")
-        with col_m2:
-            expected_merch_tickets_sold_submit = st.number_input("Expected Merch Ticket Sales", min_value=0, max_value=total_expected_attendees_overall_form, value=50, step=1, help="How many attendees you expect to buy the more expensive merch-inclusive ticket.")
-        with col_m3:
-            default_ly_merch_price = last_year_regular_price_form + merch_unit_cost_submit
-            last_year_merch_price_submit = st.number_input("Last Year's Merch Ticket Price ($)", min_value=0.0, value=default_ly_merch_price, step=1.0, help="If a similar merch ticket existed last year, what was its price?")
 
-    st.subheader("Sponsorship Scenarios")
-    sponsor_allocations_str_form = st.text_input(
-        "Sponsorship / UQCS Subsidy to Test ($)", "0, 500, 1000, 2000, 3000",
-        help="Enter different amounts of subsidy from UQCS to see how it affects ticket prices. Separate values with commas."
-    )
-    
-    with st.expander("Advanced Settings"):
-        st.markdown("These are the financial assumptions for calculations.")
-        default_refund_ui = st.slider("Refund Rate (φ) (%)", 0, 20, int(DEFAULT_REFUND_RATE*100), help="The percentage of tickets you expect to be refunded.") / 100.0
-        default_platform_fee_ui = st.slider("Platform Fee (f) (%)", 0, 20, int(DEFAULT_PLATFORM_FEE_RATE*100), help="The fee charged by the ticketing platform as a percentage of the ticket price.") / 100.0
-        default_price_cap_ui = st.number_input("Max Price Increase Cap ($)", min_value=0.0, value=DEFAULT_PRICE_INCREASE_CAP, step=1.0, help="The maximum you want the ticket price to increase compared to last year's price.")
+def md(x):  # money() escaped so Streamlit markdown doesn't treat $…$ as LaTeX
+    return money(x).replace("$", r"\$")
 
-    calculate_scenarios_button = st.form_submit_button("📊 Calculate Prices")
 
-# --- Process and Display Scenarios ---
-if calculate_scenarios_button:
-    # --- ADDED: Logic to handle optional catering calculation ---
-    if cost_per_meal_person_form > 0 and num_meal_occasions_form > 0:
-        # Use the detailed calculation
-        final_catering_cost = cost_per_meal_person_form * total_expected_attendees_overall_form * num_meal_occasions_form
-        st.success(f"Using detailed catering calculation: Total Budget = ${final_catering_cost:,.2f}")
-    else:
-        # Fall back to the main budget field
-        final_catering_cost = event_total_catering_cost_input
+def cost_editor(key, defaults):
+    import streamlit as st
+    st.markdown("**💸 Costs** — anything you pay for regardless of how many tickets sell")
+    df = st.data_editor(
+        pd.DataFrame(defaults, columns=["Item", "Cost"]), key=f"{key}_costs",
+        num_rows="dynamic", width="stretch", hide_index=True,
+        column_config={"Item": st.column_config.TextColumn("Cost item"),
+                       "Cost": st.column_config.NumberColumn("Cost ($)", min_value=0.0, format="$%.2f")})
+    return float(df["Cost"].fillna(0).sum())
 
-    merch_option_for_calc = st.session_state.merch_option_ui
 
-    if merch_option_for_calc == "Optional Merch Tickets (separate prices)" and expected_merch_tickets_sold_submit > total_expected_attendees_overall_form:
-        st.error("Error: Expected Merch Ticket Sales cannot be greater than Total Expected Attendees.")
-        st.session_state.current_scenarios = []
-    else:
-        try:
-            sponsor_allocations_list = [s.strip() for s in sponsor_allocations_str_form.split(',') if s.strip()]
-            if not sponsor_allocations_list:
-                st.error("Please enter at least one subsidy amount to test.")
-                st.session_state.current_scenarios = []
-            elif not all(s.replace('.', '', 1).lstrip('-').replace('.', '', 1).isdigit() for s in sponsor_allocations_list if s):
-                 st.error("Please enter valid comma-separated numbers for subsidy amounts.")
-                 st.session_state.current_scenarios = []
-            else:
-                st.session_state.current_scenarios = plan_event_scenarios(
-                    event_name=event_name_form, event_fixed_costs=event_fixed_costs_form,
-                    event_total_catering_cost=final_catering_cost,  # MODIFIED
-                    total_expected_attendees_overall=total_expected_attendees_overall_form,
-                    merch_option=merch_option_for_calc,
-                    merch_unit_cost=merch_unit_cost_submit,
-                    expected_merch_tickets_sold_input=expected_merch_tickets_sold_submit,
-                    last_year_regular_price=last_year_regular_price_form,
-                    last_year_merch_price=last_year_merch_price_submit,
-                    sponsor_allocations_to_test=sponsor_allocations_list,
-                    event_refund_rate=default_refund_ui,
-                    event_platform_fee_rate=default_platform_fee_ui,
-                    price_increase_cap=default_price_cap_ui
-                )
-        except Exception as e:
-            st.error(f"An error occurred during scenario calculation: {e}")
-            st.exception(e)
-            st.session_state.current_scenarios = []
+PRICING_MODES = ["Single price", "Increasing rounds", "Custom tiers"]
 
-if 'current_scenarios' in st.session_state and st.session_state.current_scenarios:
-    st.header("📈 Step 2: Review Price Scenarios")
-    current_event_name_display = st.session_state.current_scenarios[0]['event_name']
-    
-    st.info(f"""
-    This table shows the calculated ticket prices for **{current_event_name_display}**. 
-    Each row represents a scenario where UQCS contributes a different amount of subsidy to help cover event costs. 
-    The more subsidy UQCS provides, the lower the ticket price can be to break even.
-    """)
 
-    scenarios_df_display = pd.DataFrame(st.session_state.current_scenarios)
-    
-    column_rename_map = {
-        'sponsor_allocation_tested': 'UQCS Subsidy ($)',
-        'P_gross_regular': 'Regular/Bundled Price ($)',
-        'is_too_expensive_regular': 'Price Too High?',
-        'P_gross_merch': 'Merch Ticket Price ($)',
-        'is_too_expensive_merch': 'Merch Price Too High?',
-        'notes': 'Notes'
+def round_columns():
+    import streamlit as st
+    return {
+        "Round": st.column_config.TextColumn("Round / tier name"),
+        "Price": st.column_config.NumberColumn("Ticket price ($)", min_value=0.0, format="$%.2f",
+                                               help="Price shown on the ticket site"),
+        "Tickets": st.column_config.NumberColumn("Tickets expected", min_value=0, step=1),
+        "Merch": st.column_config.CheckboxColumn("Includes merch?", default=False,
+                                                 help="Tick if this ticket comes with a shirt etc."),
     }
-    
-    display_cols_base = ['sponsor_allocation_tested', 'P_gross_regular', 'is_too_expensive_regular']
-    if st.session_state.merch_option_ui == "Optional Merch Tickets (separate prices)":
-        display_cols_base.extend(['P_gross_merch', 'is_too_expensive_merch'])
-    display_cols_base.append('notes')
 
-    display_cols_final = [col for col in display_cols_base if col in scenarios_df_display.columns]
-    display_df = scenarios_df_display[display_cols_final].rename(columns=column_rename_map)
 
-    def format_price_display(x):
-        if pd.isnull(x): return "N/A"
-        if np.isinf(x): return "Error"
-        return f"${x:,.2f}"
-    
-    def format_bool_yes_no_na(x):
-        if pd.isnull(x): return "N/A"
-        return "⚠️ Yes" if x else "No"
+def rounds_editor(key, tiers, mode="Increasing rounds", price=15.0, step=5.0, n=3, total=100):
+    """Ticket input in one of three shapes; always returns a ROUND_COLS DataFrame."""
+    import streamlit as st
+    st.markdown("**🎟️ Tickets**")
+    mode = st.radio("How are tickets priced?", PRICING_MODES, index=PRICING_MODES.index(mode),
+                    horizontal=True, key=f"{key}_mode",
+                    help="Single price: one price for everyone. Increasing rounds: e.g. $15 → $20 → $25. "
+                         "Custom tiers: any mix of ticket types (early bird, merch bundles…).")
+    if mode == "Single price":
+        a, b, c = st.columns([2, 2, 1])
+        p = a.number_input("Ticket price ($)", min_value=0.0, value=price, step=1.0, key=f"{key}_p")
+        t = b.number_input("Tickets expected", min_value=0, value=total, step=5, key=f"{key}_t")
+        m = c.checkbox("Includes merch", key=f"{key}_m")
+        return pd.DataFrame([["Single price", p, t, m]], columns=ROUND_COLS)
 
+    if mode == "Increasing rounds":
+        a, b, c, d = st.columns(4)
+        p = a.number_input("Round 1 price ($)", min_value=0.0, value=price, step=1.0, key=f"{key}_rp")
+        sp = b.number_input("Increase per round ($)", min_value=0.0, value=step, step=1.0, key=f"{key}_rs")
+        rn = c.number_input("Number of rounds", min_value=1, max_value=10, value=n, key=f"{key}_rn")
+        t = d.number_input("Total tickets", min_value=0, value=total, step=5, key=f"{key}_rt")
+        st.caption("Tickets are spread evenly across rounds — edit the table to tweak any round.")
+        return st.data_editor(make_rounds(p, sp, rn, t), key=f"{key}_gen_{p}_{sp}_{rn}_{t}",
+                              num_rows="fixed", width="stretch", hide_index=True,
+                              column_config=round_columns())
+
+    st.caption("One row per ticket type — add or delete rows as needed.")
+    return st.data_editor(pd.DataFrame(tiers, columns=ROUND_COLS), key=f"{key}_rounds",
+                          num_rows="dynamic", width="stretch", hide_index=True,
+                          column_config=round_columns())
+
+
+def show_results(key, rounds, fixed_costs, refund, fee, merch_unit, contribution_label, who="UQCS",
+                 contribution=None):
+    """contribution=None asks for it with an input; otherwise uses the given amount."""
+    import streamlit as st
+    if contribution is None:
+        contribution = st.number_input(
+            contribution_label, min_value=0.0, value=0.0, step=100.0, key=f"{key}_contrib",
+            help="Used for the 'Break-even price' column: prices where this amount exactly covers the gap.")
+
+    table = round_table(rounds, refund, fee, merch_unit)
+    if table.empty:
+        st.warning("Add at least one ticket round with a price and ticket count.")
+        return None
+    s = summary(table, fixed_costs)
+    delta = break_even_shift(rounds, fixed_costs, contribution, refund, fee, merch_unit)
+    table["Break-even price"] = table["Price"] + delta
+
+    st.markdown("### 📈 Results")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total costs", money(s["costs"]), help="Fixed costs + merch for attendees who show up")
+    c2.metric("Ticket revenue we keep", money(s["revenue"]), help="After refunds and platform fees")
+    c3.metric("Tickets sold", f"{int(table['Tickets'].sum()):,}")
+    pay = "pays" if who == "UQCS" else "pay"
+    if s["uqcs_spend"] > 0:
+        c4.metric(f"Shortfall — {who} {pay}", money(s["uqcs_spend"]), delta="loss", delta_color="inverse")
+    else:
+        c4.metric(f"Surplus — {who} keeps", money(-s["uqcs_spend"]), delta="surplus")
+
+    shift_txt = ('+' if delta >= 0 else '−') + md(abs(delta))
+    if len(table) == 1:
+        st.caption(f"**Break-even ticket price: {md(table['Price'][0] + delta)}** "
+                   f"(so {who} contribute exactly {md(contribution)}).")
+    else:
+        st.caption(f"**Break-even price** = each round's price {shift_txt}, so {who} contribute exactly "
+                   f"{md(contribution)}. Round-to-round price steps are kept.")
     st.dataframe(
-        display_df.style.format({
-            "UQCS Subsidy ($)": "${:,.2f}",
-            "Regular/Bundled Price ($)": format_price_display,
-            "Merch Ticket Price ($)": format_price_display,
-            "Price Too High?": format_bool_yes_no_na,
-            "Merch Price Too High?": format_bool_yes_no_na,
-        }),
-        hide_index=True, use_container_width=True
-    )
+        table.drop(columns=["Merch"]), hide_index=True, width="stretch",
+        column_config={c: st.column_config.NumberColumn(c, format="$%.2f") for c in
+                       ["Price", "Gross sales", "Refunds", "Platform fees", "Net revenue",
+                        "Merch cost", "Running total", "Break-even price"]}
+        | {"Round": "Round / tier", "Tickets": "Tickets"})
+
+    with st.expander(f"Break-even prices if {who} contribute more…"):
+        rows = {}
+        for amt in [0, 500, 1000, 2000, 3000]:
+            d = break_even_shift(rounds, fixed_costs, amt, refund, fee, merch_unit)
+            rows[f"{who} contribute {money(amt)}"] = (table["Price"] + d).map(money).tolist()
+        st.dataframe(pd.DataFrame(rows, index=table["Round"]).T, width="stretch")
+    return s
+
+
+def main():
+    import streamlit as st
+    st.set_page_config(layout="wide", page_title="UQCS Ticket Calculator")
+    st.title("🎟️ UQCS Ticket Calculator")
+    st.write("Enter costs and ticket rounds → see how much UQCS spends, and what prices break even.")
+
+    with st.sidebar:
+        st.header("⚙️ Assumptions")
+        refund = st.slider("Refund rate (%)", 0, 20, 3, help="Share of tickets expected to be refunded") / 100
+        fee = st.slider("Platform fee (%)", 0, 20, 4, help="Humanitix etc. fee as % of ticket price") / 100
+        merch_unit = st.number_input("Merch cost per unit ($)", min_value=0.0, value=20.0, step=1.0)
+
+    hack, standard, collab, how = st.tabs(
+        ["🏆 Hackathon", "🎤 Standard event", "🤝 Collab event", "ℹ️ How it works"])
+
+    with hack:
+        st.subheader("Hackathon — prizes, catering, merch")
+        left, right = st.columns(2)
+        with left:
+            fixed = cost_editor("hack", [["Prizes", 3000.0], ["Venue / AV", 1000.0], ["Misc", 500.0]])
+        with right:
+            st.markdown("**🍕 Catering** — total = $/meal × meals × attendees")
+            a, b, c = st.columns(3)
+            per_meal = a.number_input("$ per meal per person", min_value=0.0, value=8.0, step=0.5)
+            meals = b.number_input("Meal occasions", min_value=0, value=5, step=1,
+                                   help="e.g. Fri dinner, Sat breakfast/lunch/dinner, Sun breakfast")
+            heads = c.number_input("Attendees fed", min_value=0, value=167, step=5)
+            catering = per_meal * meals * heads
+            st.info(f"Catering total: **{md(catering)}** · fixed costs incl. catering: "
+                    f"**{md(fixed + catering)}**")
+        rounds = rounds_editor("hack", mode="Custom tiers", price=45.0, total=167, tiers=[  # 2024 tiers
+            ["Early Bird + Shirt (UQ)", 55.0, 51, True], ["Early Bird (UQ)", 35.0, 86, False],
+            ["UQ Regular", 45.0, 14, False], ["Early Bird (Non-UQ)", 40.0, 9, False],
+            ["Early Bird + Shirt (Non-UQ)", 60.0, 4, True], ["Non-UQ", 50.0, 3, False]])
+        show_results("hack", rounds, fixed + catering, refund, fee, merch_unit,
+                     "UQCS / sponsor money to put in ($)")
+
+    with standard:
+        st.subheader("Standard event — networking, socials, smaller events")
+        left, right = st.columns(2)
+        with left:
+            fixed = cost_editor("std", [["Venue + food", 1500.0]])
+        with right:
+            rounds = rounds_editor("std", [["Round 1", 15.0, 40, False], ["Round 2", 20.0, 40, False],
+                                           ["Round 3", 25.0, 20, False]])
+        show_results("std", rounds, fixed, refund, fee, merch_unit, "UQCS money to put in ($)")
+
+    with collab:
+        st.subheader("Collab event — costs shared with other clubs")
+        left, right = st.columns(2)
+        with left:
+            fixed = cost_editor("col", [["Venue", 3000.0], ["Food & drinks", 4000.0]])
+            st.markdown("**🤝 Clubs involved**")
+            n = int(st.number_input("Number of clubs (incl. UQCS)", min_value=1, max_value=50, value=2))
+            st.caption("Leave the table blank for a plain split. Fill **Fixed** for a club pledging an exact "
+                       "amount, **Max** for a club that can only put in so much — the rest is split between "
+                       "everyone else. Attendees only matter for the 'By attendees' split.")
+            saved = st.session_state.get("col_clubs_saved")
+            default = pd.DataFrame({"Club": ["UQCS"] + [f"Club {i}" for i in range(2, n + 1)],
+                                    "Attendees": [None] * n, "Fixed": [None] * n, "Max": [None] * n})
+            if saved is not None:  # keep earlier edits when the club count changes
+                keep = saved.head(n).reset_index(drop=True)
+                default.iloc[:len(keep)] = keep.values
+            default = default.astype({"Attendees": float, "Fixed": float, "Max": float})
+            clubs = st.data_editor(
+                default, key=f"col_clubs_{n}", num_rows="fixed", width="stretch", hide_index=True,
+                column_config={
+                    "Club": st.column_config.TextColumn("Club"),
+                    "Attendees": st.column_config.NumberColumn("Attendees", min_value=0, format="%d"),
+                    "Fixed": st.column_config.NumberColumn("Fixed ($)", min_value=0.0, format="$%.2f",
+                                                           help="Pays exactly this, e.g. UQCS commits $1,000"),
+                    "Max": st.column_config.NumberColumn("Max ($)", min_value=0.0, format="$%.2f",
+                                                         help="Never pays more than this"),
+                })
+            st.session_state["col_clubs_saved"] = clubs
+            mode = st.radio("How to split the rest", ["Even", "By attendees"], horizontal=True,
+                            help="Usually even; use 'By attendees' for balls etc.")
+        with right:
+            rounds = rounds_editor("col", [["Round 1", 15.0, 50, False], ["Round 2", 20.0, 50, False],
+                                           ["Round 3", 25.0, 30, False]], total=130)
+        pledged = float(pd.to_numeric(clubs["Fixed"], errors="coerce").fillna(0).sum())
+        s = show_results("col", rounds, fixed, refund, fee, merch_unit, None, who="Clubs",
+                         contribution=pledged)
+        if s:
+            gap = s["uqcs_spend"]
+            split, leftover = split_between_clubs(gap, clubs, mode)
+            plain = plain_clubs(split)
+            st.markdown("### 🧾 What each club contributes at these ticket prices")
+            if gap > 0:
+                fixed_amt = split.loc[split["How"] == "fixed pledge", "Amount"].sum()
+                capped_amt = split.loc[split["How"] == "capped at max", "Amount"].sum()
+                n_split = int((split["How"].isin(["even split", "split by attendees"])).sum())
+                rest = gap - fixed_amt - capped_amt
+                lines = [("Total costs", s["costs"]),
+                         ("− Ticket revenue we keep (after refunds & fees)", -s["revenue"]),
+                         ("**= Shortfall**", gap)]
+                if fixed_amt:
+                    lines.append(("− Fixed pledges", -fixed_amt))
+                if capped_amt:
+                    lines.append(("− Clubs capped at their max", -capped_amt))
+                lines.append((f"**= Left to split between {n_split} club{'s' * (n_split != 1)}**",
+                              max(rest, 0)))
+                if mode == "Even" and len(plain):
+                    lines.append(("**÷ each of those clubs pays**", plain["Amount"].iloc[0]))
+                if leftover > 0.005:
+                    lines.append(("⚠️ Uncovered", leftover))
+                st.markdown("| How it adds up | |\n|---|---:|\n" +
+                            "\n".join(f"| {k} | {md(v)} |" for k, v in lines))
+            else:
+                st.success(f"Ticket revenue covers all costs with {md(-gap)} to spare — "
+                           "no club needs to contribute (surplus split below).")
+            split = split[["Club", "How", "Share %", "Amount"]]
+            st.dataframe(split, hide_index=True, width="stretch", column_config={
+                "How": "How it was worked out",
+                "Share %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Amount": st.column_config.NumberColumn("Pays (+) / receives (−)", format="$%.2f")})
+            if leftover > 0.005:
+                st.error(f"{md(leftover)} still uncovered — every club is at its fixed amount or max. "
+                         "Raise a max, add a club, or raise ticket prices.")
+            elif leftover < -0.005:
+                st.warning(f"Fixed pledges are {md(-leftover)} more than the shortfall — "
+                           "someone could pledge less.")
+
+            st.markdown("### 📊 Club contributions at different ticket prices")
+            st.caption("Every round's price moves up or down by the same step. If the per-club number "
+                       "at 'now' is too high, pick the row where it's one everyone can live with.")
+            step = st.number_input("Price step ($)", min_value=0.5, value=5.0, step=0.5, key="col_step")
+            grid = contributions_by_price(rounds, fixed, clubs, mode, refund, fee, merch_unit, step)
+            st.dataframe(grid, hide_index=True, width="stretch", column_config={
+                c: st.column_config.NumberColumn(c, format="$%.2f")
+                for c in grid.columns if c not in ("Price change", "Round prices")})
+
+    with how:
+        st.markdown("""
+| Column | Meaning |
+|---|---|
+| **Gross sales** | price × tickets — what buyers pay |
+| **Refunds** | gross × refund rate |
+| **Platform fees** | (gross − refunds) × platform fee |
+| **Net revenue** | what actually lands in the bank |
+| **Merch cost** | merch unit cost × tickets with merch who show up |
+| **Running total** | cumulative net revenue − merch after each round |
+| **Break-even price** | every round shifted by the same $ so the money put in exactly covers the gap |
+
+**UQCS spends** = fixed costs + catering + merch − net revenue. Negative means a surplus.
+
+Catering is treated as a fixed total (food is ordered up front; refunds don't save it).
+
+**Break-even shift** Δ = (costs − contribution − net revenue) ÷ ((1 − refund)(1 − fee) × total tickets).
+""")
+
+
+if __name__ == "__main__":
+    main()
